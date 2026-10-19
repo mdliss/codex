@@ -14,6 +14,7 @@ use codex_analytics::AppServerRpcTransport;
 use codex_app_server_protocol::InitializeResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
+use codex_app_server_protocol::ThreadArchiveResponse;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadUnsubscribeParams;
@@ -35,10 +36,15 @@ use codex_features::Feature;
 use codex_feedback::CodexFeedback;
 use codex_login::AuthManager;
 use codex_protocol::ThreadId;
+use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::user_input::UserInput;
+use codex_rollout::InitialHistory;
+use codex_rollout::ResumedHistory;
+use codex_thread_store::LoadThreadHistoryParams;
+use codex_thread_store::ThreadStore;
 use core_test_support::responses;
 use core_test_support::streaming_sse::StreamingSseChunk;
 use core_test_support::streaming_sse::start_streaming_sse_server;
@@ -291,6 +297,353 @@ async fn explicit_v2_child_watcher_survives_parent_owner_disconnect() -> Result<
         let _ = release_spawn.send(());
     }
     let _ = release_parent.send(());
+    fixture.shutdown().await;
+    server.shutdown().await;
+    result
+}
+
+#[tokio::test]
+async fn archiving_v2_root_releases_directly_observed_child_runtime() -> Result<()> {
+    let server = responses::start_mock_server().await;
+    let mut fixture = SubscriptionFixture::new(&server.uri(), 3600).await?;
+    let result: Result<()> = async {
+        let root_id = fixture.start_root().await?;
+        let child_id = spawn_child(&fixture, &server, root_id, "worker").await?;
+        fixture
+            .processor
+            .try_attach_thread_listener(child_id, vec![OWNER])
+            .await;
+        let _: ThreadResumeResponse = fixture
+            .request(
+                WATCHER,
+                "thread/resume",
+                json!({"threadId": child_id.to_string()}),
+            )
+            .await?;
+        let manager = Arc::clone(&fixture.processor.thread_processor.thread_manager);
+        let root = Arc::downgrade(&manager.get_thread(root_id).await?);
+        let child = Arc::downgrade(&manager.get_thread(child_id).await?);
+        let _: ThreadArchiveResponse = fixture
+            .request(
+                OWNER,
+                "thread/archive",
+                json!({"threadId": root_id.to_string()}),
+            )
+            .await?;
+        wait_until(
+            "archived root and observed child runtime release",
+            || async {
+                manager.get_thread(root_id).await.is_err()
+                    && manager.get_thread(child_id).await.is_err()
+                    && root.upgrade().is_none()
+                    && child.upgrade().is_none()
+            },
+        )
+        .await?;
+        Ok(())
+    }
+    .await;
+    fixture.shutdown().await;
+    result
+}
+
+#[tokio::test]
+async fn v2_unobserved_root_unloads_and_preserves_child_mail_on_reconnect() -> Result<()> {
+    let (release_spawn, spawn_gate) = oneshot::channel();
+    let (release_message, message_gate) = oneshot::channel();
+    let (release_child, child_gate) = oneshot::channel();
+    let mut release_spawn = Some(release_spawn);
+    let mut release_message = Some(release_message);
+    let (server, _completions) = start_streaming_sse_server(vec![
+        vec![
+            StreamingSseChunk {
+                gate: None,
+                body: responses::sse(vec![
+                    responses::ev_response_created("spawn"),
+                    responses::ev_function_call_with_namespace(
+                        "spawn",
+                        "collaboration",
+                        "spawn_agent",
+                        &json!({
+                            "task_name": "worker", "fork_turns": "none",
+                            "message": "Send the root an update, then keep working"
+                        })
+                        .to_string(),
+                    ),
+                ]),
+            },
+            StreamingSseChunk {
+                gate: Some(spawn_gate),
+                body: responses::sse(vec![responses::ev_completed("spawn")]),
+            },
+        ],
+        vec![StreamingSseChunk {
+            gate: Some(message_gate),
+            body: responses::sse(vec![
+                responses::ev_response_created("child-message"),
+                responses::ev_function_call_with_namespace(
+                    "send-root",
+                    "collaboration",
+                    "send_message",
+                    &json!({"target": "/root", "message": "Still working"}).to_string(),
+                ),
+                responses::ev_completed("child-message"),
+            ]),
+        }],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: responses::sse(vec![
+                responses::ev_assistant_message("root-done", "The worker is still running"),
+                responses::ev_completed("root-done"),
+            ]),
+        }],
+        vec![StreamingSseChunk {
+            gate: Some(child_gate),
+            body: responses::sse(vec![
+                responses::ev_assistant_message("child-done", "Done"),
+                responses::ev_completed("child-done"),
+            ]),
+        }],
+        // Fresh user input is sampled before queued mail. Complete this sampling
+        // without a final answer so the next request consumes the child message.
+        vec![StreamingSseChunk {
+            gate: None,
+            body: responses::sse(vec![responses::ev_completed("root-before-mail")]),
+        }],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: responses::sse(vec![
+                responses::ev_assistant_message("root-resumed", "Received the worker update"),
+                responses::ev_completed("root-resumed"),
+            ]),
+        }],
+    ])
+    .await;
+    let mut fixture = SubscriptionFixture::new(server.uri(), 1).await?;
+    let result: Result<()> = async {
+        let root_id = fixture.start_root().await?;
+        let manager = Arc::clone(&fixture.processor.thread_processor.thread_manager);
+        let root = manager.get_thread(root_id).await?;
+        let original_root = Arc::downgrade(&root);
+        let reload_config = root.config().await.as_ref().clone();
+        let rollout_path = root.rollout_path();
+        drop(root);
+        let mut created = fixture.processor.thread_created_receiver();
+        let started: TurnStartResponse = fixture
+            .request(
+                OWNER,
+                "turn/start",
+                json!({"threadId": root_id.to_string(), "input": [
+                    {"type": "text", "text": "Spawn a worker and finish your turn"}
+                ]}),
+            )
+            .await?;
+        let child_id = timeout(WAIT_TIMEOUT, created.recv())
+            .await
+            .context("spawn_agent did not create the child")??;
+        timeout(
+            WAIT_TIMEOUT,
+            fixture
+                .processor
+                .try_attach_thread_listener(child_id, vec![OWNER]),
+        )
+        .await
+        .context("initial child listener did not attach")?;
+        // Hold the parent's spawn response until the child owns the second stream.
+        timeout(WAIT_TIMEOUT, server.wait_for_request_count(2)).await?;
+        release_spawn
+            .take()
+            .context("spawn completion gate")?
+            .send(())
+            .map_err(|_| anyhow::anyhow!("spawn response stopped before release"))?;
+        fixture
+            .wait_for_turn_completed(OWNER, root_id, &started.turn.id)
+            .await?;
+        let child = manager.get_thread(child_id).await?;
+        ensure!(matches!(child.agent_status().await, AgentStatus::Running));
+
+        for connection_id in [OWNER, WATCHER, UNRELATED] {
+            let session = fixture.session(connection_id);
+            timeout(
+                WAIT_TIMEOUT,
+                fixture.processor.connection_closed(connection_id, &session),
+            )
+            .await
+            .context("client disconnect cleanup did not finish")?;
+        }
+        wait_until("original root idle unload and runtime release", || async {
+            manager.get_thread(root_id).await.is_err() && original_root.upgrade().is_none()
+        })
+        .await?;
+        ensure!(
+            matches!(child.agent_status().await, AgentStatus::Running),
+            "root idle unload must leave the gated child running"
+        );
+
+        // Native eviction lets the real queue-only tool retain mail without reloading
+        // the root. Its acknowledgement must still mean the next reconnect gets it.
+        release_message
+            .take()
+            .context("child message gate")?
+            .send(())
+            .map_err(|_| anyhow::anyhow!("child response stopped before sending its message"))?;
+        timeout(WAIT_TIMEOUT, server.wait_for_request_count(4))
+            .await
+            .context("child did not continue after send_message")?;
+        let requests = server.requests().await;
+        let child_followup: serde_json::Value = serde_json::from_slice(&requests[3])?;
+        let sent = child_followup["input"]
+            .as_array()
+            .context("child continuation input")?
+            .iter()
+            .find(|item| item["type"] == "function_call_output" && item["call_id"] == "send-root")
+            .context("child continuation must include the send_message result")?;
+        ensure!(
+            sent["output"].as_str() == Some(""),
+            "send_message to the unloaded root must succeed: {sent}"
+        );
+        ensure!(
+            manager.get_thread(root_id).await.is_err(),
+            "queue-only mail must leave the natively evicted root unloaded"
+        );
+
+        // Reload through the common core path while all clients remain disconnected,
+        // then mirror the daemon's zero-client attachment callback. This root must
+        // also unload, and its second unload must preserve the same unread message.
+        let history = fixture
+            .thread_store
+            .load_latest_model_context(LoadThreadHistoryParams {
+                thread_id: root_id,
+                include_archived: false,
+            })
+            .await?;
+        let reloaded = manager
+            .resume_thread_with_history(
+                reload_config,
+                InitialHistory::Resumed(ResumedHistory {
+                    history_revision: history.revision,
+                    conversation_id: root_id,
+                    history: Arc::new(history.items),
+                    rollout_path,
+                }),
+                manager.auth_manager(),
+                None,
+                ClientMcpExtensions::default(),
+            )
+            .await?;
+        ensure!(reloaded.thread_id == root_id, "reload must preserve the root ID");
+        let reloaded = reloaded.thread;
+        ensure!(reloaded.multi_agent_version() == Some(MultiAgentVersion::V2));
+        let config = reloaded.config_snapshot().await;
+        ensure!(!config.ephemeral);
+        ensure!(
+            !config.session_source.is_non_root_agent(),
+            "the reloaded runtime must retain its root source"
+        );
+        let reloaded_root = Arc::downgrade(&reloaded);
+        drop(reloaded);
+        timeout(
+            WAIT_TIMEOUT,
+            fixture
+                .processor
+                .try_attach_thread_listener(root_id, Vec::new()),
+        )
+        .await
+        .context("unobserved root listener attachment did not finish")?;
+
+        wait_until("reloaded root idle unload and runtime release", || async {
+            manager.get_thread(root_id).await.is_err() && reloaded_root.upgrade().is_none()
+        })
+        .await?;
+        ensure!(
+            Arc::ptr_eq(&manager.get_thread(child_id).await?, &child)
+                && matches!(child.agent_status().await, AgentStatus::Running),
+            "the root must unload while its original child keeps running"
+        );
+        ensure!(
+            server.requests().await.len() == 4,
+            "the queue-only message must not start a root turn"
+        );
+
+        // Reconnect through the ordinary client resume path after both old runtimes
+        // have been released. The child's unread mail must survive that handoff.
+        let reconnected = ConnectionId(4);
+        fixture.sessions.push((
+            reconnected,
+            Arc::new(ConnectionSessionState::new(ConnectionOrigin::WebSocket)),
+        ));
+        let _: InitializeResponse = fixture
+            .request(
+                reconnected,
+                "initialize",
+                json!({
+                    "clientInfo": {"name": "root-mail-reconnect", "version": "1"},
+                    "capabilities": {"experimentalApi": true}
+                }),
+            )
+            .await?;
+        fixture
+            .processor
+            .connection_initialized(
+                reconnected,
+                fixture.session(reconnected).request_attestation(),
+            )
+            .await;
+        let resumed: ThreadResumeResponse = fixture
+            .request(
+                reconnected,
+                "thread/resume",
+                json!({"threadId": root_id.to_string()}),
+            )
+            .await?;
+        ensure!(resumed.thread.id == root_id.to_string());
+        let continued: TurnStartResponse = fixture
+            .request(
+                reconnected,
+                "turn/start",
+                json!({"threadId": root_id.to_string(), "input": [
+                    {"type": "text", "text": "Read the worker update"}
+                ]}),
+            )
+            .await?;
+        timeout(WAIT_TIMEOUT, server.wait_for_request_count(6))
+            .await
+            .context("resumed root did not continue with its queued mail")?;
+        let requests = server.requests().await;
+        let root_request: serde_json::Value = serde_json::from_slice(&requests[5])?;
+        let queued_mail_count = root_request["input"]
+            .as_array()
+            .context("resumed root model input")?
+            .iter()
+            .filter(|item| {
+                item["type"] == "agent_message"
+                    && item["author"] == "/root/worker"
+                    && item["recipient"] == "/root"
+                    && item.to_string().contains("Still working")
+            })
+            .count();
+        ensure!(
+            queued_mail_count == 1,
+            "resumed root must receive its queued child message exactly once, got {queued_mail_count}"
+        );
+        fixture
+            .wait_for_turn_completed(reconnected, root_id, &continued.turn.id)
+            .await?;
+        ensure!(
+            Arc::ptr_eq(&manager.get_thread(child_id).await?, &child)
+                && matches!(child.agent_status().await, AgentStatus::Running),
+            "root resume must preserve its original running child"
+        );
+        Ok(())
+    }
+    .await;
+    if let Some(release_spawn) = release_spawn {
+        let _ = release_spawn.send(());
+    }
+    if let Some(release_message) = release_message {
+        let _ = release_message.send(());
+    }
+    let _ = release_child.send(());
     fixture.shutdown().await;
     server.shutdown().await;
     result
@@ -596,6 +949,7 @@ async fn evict_child(
 struct SubscriptionFixture {
     _home: TempDir,
     processor: Arc<MessageProcessor>,
+    thread_store: Arc<dyn ThreadStore>,
     sessions: Vec<(ConnectionId, Arc<ConnectionSessionState>)>,
     responses: mpsc::Receiver<OutgoingEnvelope>,
     notifications: Arc<Mutex<Vec<(Option<ConnectionId>, ServerNotification)>>>,
@@ -630,7 +984,8 @@ impl SubscriptionFixture {
             /*enable_codex_api_key_env*/ false,
         )
         .await?;
-        let (processor, mut outgoing) = build_persisted_processor(config, auth).await?;
+        let (processor, mut outgoing, thread_store) =
+            build_persisted_processor(config, auth).await?;
         let (response_tx, responses) = mpsc::channel(16);
         let notifications = Arc::new(Mutex::new(Vec::new()));
         let outgoing_task = tokio::spawn({
@@ -670,6 +1025,7 @@ impl SubscriptionFixture {
         let mut fixture = Self {
             _home: home,
             processor,
+            thread_store,
             sessions: [OWNER, WATCHER, UNRELATED]
                 .into_iter()
                 .map(|id| {
@@ -839,12 +1195,18 @@ impl SubscriptionFixture {
 async fn build_persisted_processor(
     config: Arc<Config>,
     auth_manager: Arc<AuthManager>,
-) -> Result<(Arc<MessageProcessor>, mpsc::Receiver<OutgoingEnvelope>)> {
+) -> Result<(
+    Arc<MessageProcessor>,
+    mpsc::Receiver<OutgoingEnvelope>,
+    Arc<dyn ThreadStore>,
+)> {
     let state_db = codex_state::StateRuntime::init(
         config.sqlite_config().clone(),
         config.model_provider_id.clone(),
     )
     .await?;
+    let thread_store =
+        codex_core::thread_store_from_config(config.as_ref(), Some(Arc::clone(&state_db)));
     let (outgoing_tx, outgoing_rx) = mpsc::channel(16);
     let config_manager = ConfigManager::new(
         config.codex_home.to_path_buf(),
@@ -886,7 +1248,7 @@ async fn build_persisted_processor(
         remote_control_handle: None,
         plugin_startup_tasks: Some(PluginStartupConfig::Current),
     }));
-    Ok((processor, outgoing_rx))
+    Ok((processor, outgoing_rx, thread_store))
 }
 
 async fn wait_until<F, Fut>(description: &str, mut predicate: F) -> Result<()>

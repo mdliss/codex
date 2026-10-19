@@ -3786,10 +3786,13 @@ impl ThreadRequestProcessor {
                 return;
             };
             let config_snapshot = thread.config_snapshot().await;
-            let is_v2_child = thread.multi_agent_version() == Some(MultiAgentVersion::V2)
+            let is_v2_thread = thread.multi_agent_version() == Some(MultiAgentVersion::V2)
+                && !config_snapshot.session_source.is_internal();
+            let is_v2_child = is_v2_thread
                 && matches!(config_snapshot.session_source, SessionSource::SubAgent(_));
-            // Only persisted V2 children need an unobserved lifecycle listener for idle eviction.
-            if connection_ids.is_empty() && (!is_v2_child || config_snapshot.ephemeral) {
+            // Persisted V2 roots can reload while their clients are disconnected.
+            // Keep their unobserved lifecycle listener for idle eviction too.
+            if connection_ids.is_empty() && (!is_v2_thread || config_snapshot.ephemeral) {
                 return;
             }
 

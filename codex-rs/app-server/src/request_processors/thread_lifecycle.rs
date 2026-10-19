@@ -5,7 +5,6 @@ use codex_core::ThreadEvictionOutcome;
 use codex_extension_api::ThreadIdleCause;
 use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::protocol::MultiAgentVersion;
-use codex_protocol::protocol::SessionSource;
 
 #[derive(Clone)]
 pub(super) struct ListenerTaskContext {
@@ -259,10 +258,10 @@ pub(super) async fn ensure_listener_task_running(
         )
         .await;
     let config_snapshot = conversation.config_snapshot().await;
-    let is_v2_child = conversation.multi_agent_version() == Some(MultiAgentVersion::V2)
-        && matches!(config_snapshot.session_source, SessionSource::SubAgent(_));
-    // Ephemeral children have no stored history to reload after idle eviction.
-    let can_idle_unload = !is_v2_child || !config.ephemeral;
+    let is_v2_thread = conversation.multi_agent_version() == Some(MultiAgentVersion::V2)
+        && !config_snapshot.session_source.is_internal();
+    // Ephemeral sessions have no stored history to reload after idle eviction.
+    let can_idle_unload = !is_v2_thread || !config.ephemeral;
     let thread_settings_baseline = thread_settings_from_config_snapshot(&config_snapshot);
     let (mut listener_command_rx, listener_generation) = {
         let mut thread_state = thread_state.lock().await;
@@ -330,6 +329,24 @@ pub(super) async fn ensure_listener_task_running(
                             break;
                         }
                     };
+                    let runtime_removed = if matches!(event.msg, EventMsg::ShutdownComplete) {
+                        match thread_manager.get_thread(conversation_id).await {
+                            Ok(current) if !Arc::ptr_eq(&current, &conversation) => {
+                                // A late old shutdown must not update its replacement's status.
+                                let mut state = thread_state.lock().await;
+                                if state.listener_generation == listener_generation
+                                    && let Some(completion_tx) = state.take_shutdown_drain_waiter()
+                                {
+                                    let _ = completion_tx.send(());
+                                }
+                                break;
+                            }
+                            Ok(_) => false,
+                            Err(_) => true,
+                        }
+                    } else {
+                        false
+                    };
 
                     if let Some(worker) = &turn_cost_worker {
                         worker.observe_event(
@@ -389,15 +406,18 @@ pub(super) async fn ensure_listener_task_running(
                     )
                     .await;
                     if matches!(event.msg, EventMsg::ShutdownComplete) {
-                        if let Some(completion_tx) = thread_state
-                            .lock()
-                            .await
-                            .take_shutdown_drain_waiter()
+                        // Revert waits for this barrier before replacing the runtime. All
+                        // accepted shutdown side effects must complete before acknowledging it.
+                        let mut state = thread_state.lock().await;
+                        if state.listener_generation == listener_generation
+                            && let Some(completion_tx) = state.take_shutdown_drain_waiter()
                         {
                             let _ = completion_tx.send(());
                         }
-                        if !can_idle_unload {
-                            // Retain ephemeral history while idle, but release it on explicit close.
+                        drop(state);
+                        if !can_idle_unload || runtime_removed {
+                            // Explicit root removal also detaches its stopped descendants.
+                            // Release their listeners even if direct observers remain attached.
                             break;
                         }
                     }
@@ -423,61 +443,7 @@ pub(super) async fn ensure_listener_task_running(
                         }
                         pending_thread_unloads.insert(conversation_id, watch::channel(()).0);
                     }
-                    if is_v2_child {
-                        let eviction = thread_manager.try_evict_v2_thread(Arc::clone(&conversation));
-                        tokio::pin!(eviction);
-                        let result = match tokio::time::timeout(
-                            Duration::from_secs(/*secs*/ 10), &mut eviction,
-                        ).await {
-                            Ok(result) => result,
-                            Err(_) => {
-                                warn!(event.name = "codex.app_server.thread_shutdown_slow", "thread {conversation_id} shutdown is taking longer than expected; continuing to wait");
-                                eviction.await
-                            }
-                        };
-                        let outcome = match result {
-                            Ok(ThreadEvictionOutcome::Busy) => {
-                                pending_thread_unloads.lock().await.remove(&conversation_id);
-                                unloading_state.note_thread_activity_observed();
-                                continue;
-                            }
-                            Ok(outcome @ (ThreadEvictionOutcome::Evicted | ThreadEvictionOutcome::NotCurrent)) => outcome,
-                            Err(err) => {
-                                warn!("failed to evict thread {conversation_id}: {err}");
-                                pending_thread_unloads.lock().await.remove(&conversation_id);
-                                unloading_state.note_thread_activity_observed();
-                                continue;
-                            }
-                        };
-                        {
-                            let mut pending = pending_thread_unloads.lock().await;
-                            if !thread_state_manager.remove_unsubscribed_listener(
-                                conversation_id, &thread_state, listener_generation,
-                            ).await {
-                                pending.remove(&conversation_id);
-                                break;
-                            }
-                        }
-                        // Release the status receiver before removing its watch entry.
-                        drop(unloading_state);
-                        outgoing_for_task
-                            .cancel_requests_for_thread(conversation_id, /*error*/ None)
-                            .await;
-                        // A runtime removed by someone else may already have a replacement.
-                        if outcome == ThreadEvictionOutcome::Evicted {
-                            thread_watch_manager
-                                .remove_thread(&conversation_id.to_string())
-                                .await;
-                            outgoing_for_task
-                                .send_server_notification(ServerNotification::ThreadClosed(
-                                    ThreadClosedNotification { thread_id: conversation_id.to_string() },
-                                ))
-                                .await;
-                        }
-                        pending_thread_unloads.lock().await.remove(&conversation_id);
-                        return;
-                    }
-                    if is_v2_child {
+                    if is_v2_thread {
                         let eviction = thread_manager.try_evict_v2_thread(Arc::clone(&conversation));
                         tokio::pin!(eviction);
                         let result = match tokio::time::timeout(
