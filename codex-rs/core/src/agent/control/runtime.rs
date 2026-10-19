@@ -246,6 +246,11 @@ impl LocalAgentRuntime {
         self.registry.has_spawned_agents() || self.mailboxes.has_pending()
     }
 
+    /// Call after publication while the root resume gate or a residency pin is held.
+    pub(crate) fn clear_evicted_environments(&self, thread_id: ThreadId) {
+        self.registry.clear_evicted_environments(thread_id);
+    }
+
     /// Call only after dispatch stops and delivery is excluded by the caller's gate.
     pub(crate) async fn retain_pending_mail(&self, session: &Session) {
         let mail = session

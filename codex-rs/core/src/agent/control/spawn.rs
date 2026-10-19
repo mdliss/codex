@@ -679,9 +679,10 @@ impl LocalAgentControl {
                     if let Some(parent_thread_id) = owner_thread_id {
                         self.validate_loaded_v2_child(&thread, parent_thread_id)?;
                     }
-                    self.runtime.registry.clear_evicted_environments(thread_id);
                     drop(residency_slot);
-                    return self.runtime.pin_v2_residency(&state, &thread).await;
+                    let residency_pin = self.runtime.pin_v2_residency(&state, &thread).await?;
+                    self.runtime.registry.clear_evicted_environments(thread_id);
+                    return Ok(residency_pin);
                 }
                 Err(err)
             }

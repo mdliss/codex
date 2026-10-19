@@ -2550,6 +2550,7 @@ impl ThreadManagerState {
             // Publication is the root startup commit. There must be no await between
             // registration and this handoff: lifecycle-hook cancellation must not stop a
             // visible root after senders or automatic wakeup can consume its retained mail.
+            runtime.clear_evicted_environments(new_thread.thread_id);
             startup_state.release_membership();
             if let Some(startup_guard) = startup_guard.take() {
                 startup_guard.disarm();

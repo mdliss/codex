@@ -6,6 +6,7 @@ use crate::agent::api::AgentInput;
 use crate::agent::api::AgentTarget;
 use crate::agent::api::SendRequest;
 use crate::agent::api::SpawnRequest;
+use crate::agent::child_config::build_agent_resume_config;
 use crate::agent::next_thread_spawn_depth;
 use crate::agent::registry::AgentRegistry;
 use crate::agent::types::AgentMessage;
@@ -33,10 +34,12 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
+use codex_protocol::protocol::TurnEnvironmentRequests;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::user_input::UserInput;
 use codex_thread_store::LoadThreadHistoryParams;
@@ -845,6 +848,11 @@ async fn cancelled_published_root_resume_keeps_runtime_and_accepted_mail() {
         .services
         .local_agent_runtime
         .control(published.session.session_id());
+    assert_eq!(
+        control.runtime.registry.evicted_environments(saved.root_id),
+        None,
+        "publication clears the snapshot before lifecycle callbacks can be cancelled",
+    );
     const ACCEPTED_MAIL: &str = "root-residency: accepted after publication";
     harness
         .send_root_mail(&control, saved.child_id, saved.root_id, ACCEPTED_MAIL)
@@ -860,9 +868,147 @@ async fn cancelled_published_root_resume_keeps_runtime_and_accepted_mail() {
         &harness.manager.get_thread(saved.root_id).await.unwrap(),
         &published,
     ));
+    assert_eq!(
+        control.runtime.registry.evicted_environments(saved.root_id),
+        None,
+    );
     assert_preserved_root(&saved, &published).await;
     assert_root_mail(&published, &[ROOT_MAIL, ACCEPTED_MAIL]).await;
     assert!(control.runtime.admit_start().is_ok());
+    harness.shutdown().await;
+}
+
+#[test_case(false; "client_resume")]
+#[test_case(true; "sender_resume")]
+#[tokio::test]
+async fn cancelled_root_resume_preserves_environment_and_queue_only_delivery(sender_resume: bool) {
+    let gate = Arc::new(RootResumeGate::default());
+    let harness = RootResidencyHarness::new(Some(Arc::clone(&gate))).await;
+    let root = harness
+        .manager
+        .start_thread(StartThreadOptions {
+            history_mode: Some(ThreadHistoryMode::Paginated),
+            thread_source: Some(ThreadSource::User),
+            ..StartThreadOptions::new(harness.config.clone())
+        })
+        .await
+        .expect("start root with its selected environment")
+        .thread;
+    persist_idle_thread(&root, "root history with an environment").await;
+    let root_id = root.session.thread_id;
+    let environments = root.environment_selections().await;
+    assert!(!environments.is_empty());
+    let control = root
+        .session
+        .services
+        .local_agent_runtime
+        .control(root.session.session_id());
+    let (child, _) = control
+        .spawn(registered_child_request(&harness.config, &root))
+        .await
+        .expect("spawn child before root eviction");
+    let child_id = child.thread_id;
+    let child = harness.manager.get_thread(child_id).await.unwrap();
+    persist_idle_thread(&child, "child history").await;
+
+    let child_cwd = harness.config.cwd.join("child-workspace");
+    std::fs::create_dir(child_cwd.as_path()).expect("create a distinct child working directory");
+    child
+        .update_thread_settings(ThreadSettingsOverrides {
+            environments: Some(TurnEnvironmentRequests::new(
+                child_cwd.clone(),
+                harness
+                    .manager
+                    .default_environment_requests(&child_cwd, std::slice::from_ref(&child_cwd)),
+            )),
+            ..Default::default()
+        })
+        .await
+        .expect("give the child its own working directory");
+    let child_turn = child
+        .session
+        .new_turn_with_default_settings("child-workspace".to_string(), Default::default())
+        .await;
+    let sender_config = build_agent_resume_config(&child_turn).expect("child resume settings");
+    assert_eq!(sender_config.cwd, child_cwd);
+    assert_ne!(sender_config.cwd, harness.config.cwd);
+
+    harness
+        .send_root_mail(&control, child_id, root_id, ROOT_MAIL)
+        .await;
+    harness.evict(&root).await;
+    let old_root = Arc::downgrade(&root);
+    drop(root);
+    assert_thread_released(old_root).await;
+    assert_eq!(
+        control.runtime.registry.evicted_environments(root_id),
+        Some(environments.clone()),
+    );
+
+    gate.block_start.store(true, Ordering::SeqCst);
+    let resume = tokio::spawn(resume_root(
+        Arc::clone(&harness.manager),
+        harness.config.clone(),
+        harness.history(root_id).await,
+    ));
+    timeout(Duration::from_secs(5), gate.entered.notified())
+        .await
+        .expect("resume restores metadata before its startup is cancelled");
+    resume.abort();
+    assert!(matches!(resume.await, Err(error) if error.is_cancelled()));
+    let cleanup_barrier = timeout(
+        Duration::from_secs(5),
+        harness.state.root_runtimes.gate(root_id).lock_owned(),
+    )
+    .await
+    .expect("cancelled startup releases the root gate after cleanup");
+    drop(cleanup_barrier);
+    assert_eq!(
+        control.runtime.registry.evicted_environments(root_id),
+        Some(environments.clone()),
+        "unpublished resume must preserve the root's eviction snapshot",
+    );
+
+    const AFTER_CANCEL: &str = "root-residency: mail after cancelled reconnect";
+    timeout(
+        Duration::from_secs(5),
+        control.send(root_mail_request(
+            &sender_config,
+            child_id,
+            root_id,
+            AFTER_CANCEL,
+        )),
+    )
+    .await
+    .expect("queue-only send finishes without reopening the root")
+    .expect("accept child mail after cancelled reconnect");
+    assert!(
+        harness.manager.get_thread(root_id).await.is_err(),
+        "queue-only mail must leave the evicted root unloaded",
+    );
+    assert_eq!(
+        control.runtime.registry.evicted_environments(root_id),
+        Some(environments.clone()),
+    );
+
+    let resumed = if sender_resume {
+        let pin = control
+            .ensure_v2_agent_loaded(sender_config, root_id, None)
+            .await
+            .expect("sender-driven resume uses the retained root environment");
+        drop(pin);
+        harness.manager.get_thread(root_id).await.unwrap()
+    } else {
+        harness.resume(root_id).await
+    };
+    assert_eq!(resumed.environment_selections().await, environments);
+    assert_eq!(control.runtime.registry.evicted_environments(root_id), None);
+    assert_root_mail(&resumed, &[ROOT_MAIL, AFTER_CANCEL]).await;
+    assert!(resumed.session.active_turn.lock().await.is_none());
+    assert!(Arc::ptr_eq(
+        &harness.manager.get_thread(child_id).await.unwrap(),
+        &child,
+    ));
     harness.shutdown().await;
 }
 
