@@ -311,13 +311,16 @@ pub(super) fn is_v2_resident_session_source(session_source: &SessionSource) -> b
 }
 
 async fn is_unloadable(thread: &CodexThread) -> bool {
-    matches!(
-        thread.agent_status().await,
-        AgentStatus::PendingInit
-            | AgentStatus::Completed(_)
-            | AgentStatus::Errored(_)
-            | AgentStatus::Interrupted
-    ) && thread.session.active_turn.lock().await.is_none()
+    // Ephemeral children must retain their model context until explicitly closed.
+    !thread.config().await.ephemeral
+        && matches!(
+            thread.agent_status().await,
+            AgentStatus::PendingInit
+                | AgentStatus::Completed(_)
+                | AgentStatus::Errored(_)
+                | AgentStatus::Interrupted
+        )
+        && thread.session.active_turn.lock().await.is_none()
         && !thread.session.has_outstanding_durable_sleep()
         && !thread
             .session
