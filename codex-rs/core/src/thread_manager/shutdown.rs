@@ -1,4 +1,4 @@
-//! Unloads locally controlled idle MAv2 children and exposes tracked agent-tree teardown.
+//! Unloads locally controlled idle MAv2 sessions and exposes tracked agent-tree teardown.
 
 use super::ThreadManager;
 use crate::agent::control::AgentTreeShutdownState;
@@ -129,7 +129,7 @@ impl AgentTreeShutdown {
 }
 
 impl ThreadManager {
-    /// Unloads this exact idle MAv2 child using the manager's local controller backend,
+    /// Unloads this exact idle MAv2 root or child using the manager's local controller backend,
     /// preserving mail and environments for reloading. Host controllers own their eviction
     /// and recovery; managers configured with a host controller factory are rejected.
     /// Dropping the future after shutdown starts does not cancel cleanup.
@@ -149,7 +149,7 @@ impl ThreadManager {
         self.state.try_evict_v2_thread(thread, &membership).await
     }
 
-    /// Requests shutdown of a loaded thread and every session sharing its local runtime.
+    /// Requests shutdown of a loaded thread or retained root and its entire local runtime.
     ///
     /// Returns after fencing new starts and signalling admitted sessions. Callers can wait on the
     /// returned handle before completing registry cleanup or a persistence handoff. This fences
@@ -159,13 +159,15 @@ impl ThreadManager {
         &self,
         thread_id: ThreadId,
     ) -> CodexResult<AgentTreeShutdown> {
-        let thread = self.get_thread(thread_id).await?;
-        Ok(AgentTreeShutdown {
-            state: thread
-                .session
-                .services
-                .local_agent_runtime
-                .request_shutdown(),
-        })
+        // Match eviction's threads -> cache order so a closing tree cannot be retained later.
+        let threads = self.state.threads.read().await;
+        let runtime = threads
+            .get(&thread_id)
+            .map(|thread| thread.session.services.local_agent_runtime.clone())
+            .or_else(|| self.state.root_runtimes.get(thread_id))
+            .ok_or(CodexErr::ThreadNotFound(thread_id))?;
+        let state = runtime.request_shutdown();
+        self.state.root_runtimes.remove_tree(&runtime);
+        Ok(AgentTreeShutdown { state })
     }
 }

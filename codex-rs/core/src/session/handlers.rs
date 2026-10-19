@@ -445,7 +445,21 @@ pub(super) async fn submission_loop(
     sess: Arc<Session>,
     config: Arc<Config>,
     rx_sub: Receiver<Submission>,
+    root_resume_ready: Option<tokio::sync::watch::Receiver<bool>>,
 ) {
+    if let Some(mut ready) = root_resume_ready {
+        // Cached root mail cannot enter a turn until publication commits startup.
+        // Failed startup closes the latch before waiting for this loop to stop.
+        let published = tokio::select! {
+            biased;
+            _ = sess.services.local_agent_runtime.shutdown.cancelled() => false,
+            result = ready.wait_for(|published| *published) => result.is_ok(),
+        };
+        if !published {
+            shutdown(&sess, super::new_submission_id()).await;
+            return;
+        }
+    }
     // Session shutdown and tree shutdown both use the existing teardown handler.
     let mut shutdown_received = false;
     let mut mailbox = sess.input_queue.mailbox_updates();

@@ -223,6 +223,11 @@ impl AgentRegistry {
             .collect()
     }
 
+    /// Includes pending reservations so an unloaded root keeps an admitted child's tree.
+    pub(crate) fn has_spawned_agents(&self) -> bool {
+        self.total_count.load(Ordering::Acquire) != 0
+    }
+
     fn register_spawned_thread(&self, agent_metadata: AgentMetadata) {
         let Some(thread_id) = agent_metadata.agent_id else {
             return;

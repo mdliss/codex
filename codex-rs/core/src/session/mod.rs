@@ -1024,11 +1024,19 @@ impl Session {
         let tree_teardown = startup
             .as_ref()
             .and_then(|startup| startup.session_teardown(thread_id));
+        let root_resume_ready = startup
+            .as_ref()
+            .and_then(|startup| startup.root_resume_ready());
         let session_for_loop = Arc::clone(&session);
         let session_loop_handle = tokio::spawn(Box::pin(storage_originator.scope(async move {
-            submission_loop(session_for_loop, configured_config, rx_sub)
-                .instrument(info_span!("session_loop", thread_id = %thread_id))
-                .await;
+            submission_loop(
+                session_for_loop,
+                configured_config,
+                rx_sub,
+                root_resume_ready,
+            )
+            .instrument(info_span!("session_loop", thread_id = %thread_id))
+            .await;
             if let Some(tree_teardown) = tree_teardown {
                 tree_teardown.complete();
             }
