@@ -565,6 +565,7 @@ async fn submitted_sparse_updates_preserve_captured_steps_and_ordering() {
         Arc::clone(&session),
         session.get_config().await,
         receiver,
+        None,
     ));
     let before = session
         .capture_step_context(Arc::clone(&turn), &CancellationToken::new())

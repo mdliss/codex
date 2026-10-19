@@ -104,6 +104,18 @@ impl Mailboxes {
         }
     }
 
+    pub(super) fn has_pending(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|mailboxes| {
+                mailboxes
+                    .values()
+                    .any(|mailbox| !mailbox.pending.is_empty())
+            })
+    }
+
     pub(super) fn close(&self) {
         if let Some(mailboxes) = self.0.lock().unwrap_or_else(PoisonError::into_inner).take() {
             for mailbox in mailboxes.values() {

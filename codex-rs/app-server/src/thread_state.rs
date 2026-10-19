@@ -288,6 +288,285 @@ mod tests {
         assert_eq!(results, vec![true, false, true, false]);
     }
 
+    #[tokio::test]
+    async fn inherited_subscriptions_require_current_ancestor_membership() {
+        let owner = ConnectionId(1);
+        let unrelated = ConnectionId(2);
+        let manager = manager_with_connections(&[owner, unrelated]).await;
+        let root = ThreadId::from_u128(1);
+        let child = ThreadId::from_u128(2);
+        assert!(manager.try_add_connection_to_thread(root, owner).await);
+        let candidates = [owner, unrelated];
+
+        assert!(
+            manager
+                .unsubscribe_connection_from_thread(root, owner)
+                .await
+        );
+        let (_, newly_subscribed) = manager
+            .inherit_thread_subscriptions(child, &candidates, Some(&[root]))
+            .await;
+
+        assert!(newly_subscribed.is_empty());
+        assert!(!manager.has_subscribers(child).await);
+        let has_connections = manager
+            .subscribe_to_has_connections(child)
+            .await
+            .expect("unobserved child retains lifecycle state");
+        assert!(!*has_connections.borrow());
+        assert!(manager.try_add_connection_to_thread(root, owner).await);
+        assert!(!manager.has_subscribers(child).await);
+    }
+
+    #[tokio::test]
+    async fn inherited_subscriptions_reject_closed_candidates() {
+        let owner = ConnectionId(1);
+        let unrelated = ConnectionId(2);
+        let manager = manager_with_connections(&[owner, unrelated]).await;
+        let root = ThreadId::from_u128(1);
+        let child = ThreadId::from_u128(2);
+        assert!(manager.try_add_connection_to_thread(root, owner).await);
+        let candidates = [owner, unrelated];
+
+        assert_eq!(manager.remove_connection(owner).await, vec![root]);
+        let (_, newly_subscribed) = manager
+            .inherit_thread_subscriptions(child, &candidates, Some(&[root]))
+            .await;
+
+        assert!(newly_subscribed.is_empty());
+        assert!(!manager.has_subscribers(child).await);
+        assert!(!manager.try_add_connection_to_thread(child, owner).await);
+        assert!(manager.remove_connection(owner).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inherited_subscriptions_use_root_without_intermediate_subscriptions() {
+        let owner = ConnectionId(1);
+        let unrelated = ConnectionId(2);
+        let manager = manager_with_connections(&[owner, unrelated]).await;
+        let root = ThreadId::from_u128(1);
+        let parent = ThreadId::from_u128(2);
+        let child = ThreadId::from_u128(3);
+        assert!(manager.try_add_connection_to_thread(root, owner).await);
+
+        let (_, newly_subscribed) = manager
+            .inherit_thread_subscriptions(child, &[owner, unrelated], Some(&[parent, root]))
+            .await;
+
+        assert_eq!(newly_subscribed, vec![owner]);
+        assert_eq!(
+            subscription_set(&manager, child).await,
+            HashSet::from([owner])
+        );
+        assert!(!manager.has_subscribers(parent).await);
+        assert_eq!(
+            subscription_set(&manager, root).await,
+            HashSet::from([owner])
+        );
+    }
+
+    #[tokio::test]
+    async fn inherited_subscriptions_preserve_direct_child_watchers() {
+        let owner = ConnectionId(1);
+        let direct_watcher = ConnectionId(2);
+        let unrelated = ConnectionId(3);
+        let manager = manager_with_connections(&[owner, direct_watcher, unrelated]).await;
+        let root = ThreadId::from_u128(1);
+        let child = ThreadId::from_u128(2);
+        assert!(manager.try_add_connection_to_thread(root, owner).await);
+        let original_state = manager
+            .try_ensure_connection_subscribed(
+                child,
+                direct_watcher,
+                /*experimental_raw_events*/ true,
+            )
+            .await
+            .expect("direct watcher is live");
+        let (cancel_tx, _cancel_rx) = oneshot::channel();
+        original_state.lock().await.cancel_tx = Some(cancel_tx);
+        let has_connections = manager
+            .subscribe_to_has_connections(child)
+            .await
+            .expect("direct watcher created child state");
+
+        let (state, newly_subscribed) = manager
+            .inherit_thread_subscriptions(child, &[owner, unrelated], Some(&[root]))
+            .await;
+        assert!(Arc::ptr_eq(&state, &original_state));
+        assert_eq!(newly_subscribed, vec![owner]);
+        let (_, repeated_subscriptions) = manager
+            .inherit_thread_subscriptions(child, &[owner, direct_watcher, unrelated], Some(&[root]))
+            .await;
+        assert!(repeated_subscriptions.is_empty());
+        assert_eq!(
+            subscription_set(&manager, child).await,
+            HashSet::from([owner, direct_watcher])
+        );
+        {
+            let state = state.lock().await;
+            assert!(state.experimental_raw_events);
+            assert!(state.cancel_tx.is_some());
+        }
+
+        assert_eq!(manager.remove_connection(owner).await, vec![root]);
+        assert_eq!(
+            subscription_set(&manager, child).await,
+            HashSet::from([direct_watcher])
+        );
+        assert!(*has_connections.borrow());
+        assert!(
+            manager
+                .unsubscribe_connection_from_thread(child, direct_watcher)
+                .await
+        );
+        assert!(!*has_connections.borrow());
+    }
+
+    #[tokio::test]
+    async fn inherited_subscription_rollback_excludes_existing_memberships() {
+        let existing_owner = ConnectionId(1);
+        let new_owner = ConnectionId(2);
+        let direct_watcher = ConnectionId(3);
+        let manager = manager_with_connections(&[existing_owner, new_owner, direct_watcher]).await;
+        let root = ThreadId::from_u128(1);
+        let child = ThreadId::from_u128(2);
+        for owner in [existing_owner, new_owner] {
+            assert!(manager.try_add_connection_to_thread(root, owner).await);
+        }
+        for watcher in [existing_owner, direct_watcher] {
+            assert!(manager.try_add_connection_to_thread(child, watcher).await);
+        }
+
+        let (_, newly_subscribed) = manager
+            .inherit_thread_subscriptions(
+                child,
+                &[existing_owner, new_owner, direct_watcher, new_owner],
+                Some(&[root]),
+            )
+            .await;
+        assert_eq!(newly_subscribed, vec![new_owner]);
+        for connection_id in newly_subscribed {
+            assert!(
+                manager
+                    .unsubscribe_connection_from_thread(child, connection_id)
+                    .await
+            );
+        }
+
+        assert_eq!(
+            subscription_set(&manager, child).await,
+            HashSet::from([existing_owner, direct_watcher])
+        );
+        assert_eq!(
+            subscription_set(&manager, root).await,
+            HashSet::from([existing_owner, new_owner])
+        );
+        assert!(
+            !manager
+                .unsubscribe_connection_from_thread(child, new_owner)
+                .await
+        );
+        let has_connections = manager
+            .subscribe_to_has_connections(child)
+            .await
+            .expect("existing subscriptions retain child state");
+        assert!(*has_connections.borrow());
+    }
+
+    #[tokio::test]
+    async fn automatic_subscription_filter_distinguishes_empty_ancestry_from_legacy() {
+        let first = ConnectionId(1);
+        let second = ConnectionId(2);
+        let closed = ConnectionId(3);
+        let unknown = ConnectionId(4);
+        let manager = manager_with_connections(&[first, second, closed]).await;
+        let child = ThreadId::from_u128(1);
+        manager.remove_connection(closed).await;
+        let candidates = [first, second, closed, unknown];
+
+        let (_, newly_subscribed) = manager
+            .inherit_thread_subscriptions(child, &candidates, Some(&[]))
+            .await;
+        assert!(newly_subscribed.is_empty());
+        assert!(!manager.has_subscribers(child).await);
+        let has_connections = manager
+            .subscribe_to_has_connections(child)
+            .await
+            .expect("unobserved child retains lifecycle state");
+        assert!(!*has_connections.borrow());
+
+        let (_, newly_subscribed) = manager
+            .inherit_thread_subscriptions(child, &candidates, None)
+            .await;
+        assert_eq!(newly_subscribed, vec![first, second]);
+        assert_eq!(
+            subscription_set(&manager, child).await,
+            HashSet::from([first, second])
+        );
+        assert!(*has_connections.borrow());
+        let (_, repeated_subscriptions) = manager
+            .inherit_thread_subscriptions(child, &candidates, None)
+            .await;
+        assert!(repeated_subscriptions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ancestor_unsubscribe_after_inheritance_preserves_child_membership() {
+        let owner = ConnectionId(1);
+        let manager = manager_with_connections(&[owner]).await;
+        let root = ThreadId::from_u128(1);
+        let child = ThreadId::from_u128(2);
+        assert!(manager.try_add_connection_to_thread(root, owner).await);
+        let (_, newly_subscribed) = manager
+            .inherit_thread_subscriptions(child, &[owner], Some(&[root]))
+            .await;
+        assert_eq!(newly_subscribed, vec![owner]);
+        let has_connections = manager
+            .subscribe_to_has_connections(child)
+            .await
+            .expect("inherited subscription created child state");
+
+        assert!(
+            manager
+                .unsubscribe_connection_from_thread(root, owner)
+                .await
+        );
+        let (_, repeated_subscriptions) = manager
+            .inherit_thread_subscriptions(child, &[owner], Some(&[root]))
+            .await;
+        assert!(repeated_subscriptions.is_empty());
+        assert_eq!(
+            subscription_set(&manager, child).await,
+            HashSet::from([owner])
+        );
+        assert!(*has_connections.borrow());
+
+        assert_eq!(manager.remove_connection(owner).await, vec![child]);
+        assert!(!manager.has_subscribers(child).await);
+        assert!(!*has_connections.borrow());
+    }
+
+    async fn manager_with_connections(connection_ids: &[ConnectionId]) -> ThreadStateManager {
+        let manager = ThreadStateManager::new();
+        for connection_id in connection_ids {
+            manager
+                .connection_initialized(*connection_id, ConnectionCapabilities::default())
+                .await;
+        }
+        manager
+    }
+
+    async fn subscription_set(
+        manager: &ThreadStateManager,
+        thread_id: ThreadId,
+    ) -> HashSet<ConnectionId> {
+        manager
+            .subscribed_connection_ids(thread_id)
+            .await
+            .into_iter()
+            .collect()
+    }
+
     fn thread_settings(model: &str) -> ThreadSettings {
         ThreadSettings {
             disabled_plugin_ids: Vec::new(),
@@ -626,6 +905,51 @@ impl ThreadStateManager {
             }
         }
         Some(thread_state)
+    }
+
+    /// Adds automatic subscriptions using current liveness and ancestor membership.
+    ///
+    /// `None` preserves legacy attachment to all live candidates. `Some` requires a
+    /// subscription to at least one ancestor. Existing child subscriptions are preserved;
+    /// the returned IDs contain only new memberships that can be rolled back on failure.
+    pub(crate) async fn inherit_thread_subscriptions(
+        &self,
+        thread_id: ThreadId,
+        candidate_connection_ids: &[ConnectionId],
+        ancestor_thread_ids: Option<&[ThreadId]>,
+    ) -> (Arc<Mutex<ThreadState>>, Vec<ConnectionId>) {
+        let mut state = self.state.lock().await;
+        let eligible_connection_ids = candidate_connection_ids
+            .iter()
+            .copied()
+            .filter(|connection_id| {
+                state.live_connections.contains_key(connection_id)
+                    && ancestor_thread_ids.is_none_or(|ancestor_thread_ids| {
+                        state
+                            .thread_ids_by_connection
+                            .get(connection_id)
+                            .is_some_and(|thread_ids| {
+                                ancestor_thread_ids.iter().any(|ancestor_thread_id| {
+                                    thread_ids.contains(ancestor_thread_id)
+                                })
+                            })
+                    })
+            })
+            .collect::<Vec<_>>();
+        for connection_id in &eligible_connection_ids {
+            state
+                .thread_ids_by_connection
+                .entry(*connection_id)
+                .or_default()
+                .insert(thread_id);
+        }
+        let thread_entry = state.threads.entry(thread_id).or_default();
+        let newly_subscribed = eligible_connection_ids
+            .into_iter()
+            .filter(|connection_id| thread_entry.connection_ids.insert(*connection_id))
+            .collect();
+        thread_entry.update_has_connections();
+        (Arc::clone(&thread_entry.state), newly_subscribed)
     }
 
     pub(crate) async fn try_add_connection_to_thread(

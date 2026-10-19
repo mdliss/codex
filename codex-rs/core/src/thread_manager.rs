@@ -1,4 +1,5 @@
 mod managed;
+mod root_runtimes;
 mod shared_instructions;
 mod shutdown;
 
@@ -73,6 +74,7 @@ use codex_models_manager::manager::RefreshStrategy;
 use codex_models_manager::manager::SharedModelsManager;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::CollaborationModeMask;
+use codex_protocol::error::AgentErrorContext;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::mcp::ClientMcpExtensions;
@@ -423,6 +425,7 @@ pub(crate) struct ResumeThreadWithHistoryOptions {
 pub(crate) struct ThreadManagerState {
     // Eviction updates this registry and residency together, locking the registry first.
     pub(crate) threads: Arc<RwLock<HashMap<ThreadId, Arc<CodexThread>>>>,
+    pub(crate) root_runtimes: root_runtimes::RootRuntimes,
     shared_thread_instructions: shared_instructions::SharedThreadInstructionsProviders,
     thread_created_tx: broadcast::Sender<ThreadId>,
     thread_id_generator: ThreadIdGenerator,
@@ -589,6 +592,7 @@ impl ThreadManager {
         Self {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
+                root_runtimes: Default::default(),
                 shared_thread_instructions: Default::default(),
                 thread_created_tx,
                 thread_id_generator: default_thread_id_generator(),
@@ -777,6 +781,7 @@ impl ThreadManager {
         Self {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
+                root_runtimes: Default::default(),
                 shared_thread_instructions: Default::default(),
                 thread_created_tx,
                 thread_id_generator: default_thread_id_generator(),
@@ -1397,6 +1402,7 @@ impl ThreadManager {
 
     /// Removes a runtime for a client request, leaving internal workers with their owner.
     /// The access check and removal share the same lock so a rejected worker stays registered.
+    /// Removing a local V2 root also retires the exact tree's loaded and retained runtimes.
     pub async fn remove_thread_for_client(
         &self,
         thread_id: &ThreadId,
@@ -1410,7 +1416,47 @@ impl ThreadManager {
                 "live internal threads can only be removed by their owner".to_owned(),
             ));
         }
-        Ok(threads.remove(thread_id))
+        let root_runtime = if self.state.agent_control_factory.is_none() {
+            threads
+                .get(thread_id)
+                .filter(|thread| {
+                    thread.multi_agent_version() == Some(MultiAgentVersion::V2)
+                        && !thread.session_source.is_non_root_agent()
+                })
+                .map(|thread| thread.session.services.local_agent_runtime.clone())
+                .or_else(|| self.state.root_runtimes.get(*thread_id))
+        } else {
+            None
+        };
+        let removed = threads.remove(thread_id);
+        let descendants = if let Some(runtime) = root_runtime {
+            // Fence admitted starts and evictions before detaching exact tree instances.
+            // Otherwise their stopped sessions cannot admit a later idle eviction.
+            runtime.request_shutdown();
+            self.state.root_runtimes.remove_tree(&runtime);
+            threads
+                .extract_if(|_, thread| {
+                    runtime.same_tree(&thread.session.services.local_agent_runtime)
+                })
+                .map(|(_, thread)| thread)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        drop(threads);
+        for descendant in descendants {
+            // The loop retains tree membership; this task owns its final runtime handle
+            // even if the archive/delete caller stops waiting for the root.
+            tokio::spawn(async move {
+                if let Err(err) = descendant.shutdown_and_wait().await {
+                    warn!(
+                        "failed to stop removed descendant {}: {err}",
+                        descendant.session.thread_id
+                    );
+                }
+            });
+        }
+        Ok(removed)
     }
 
     /// Removes a thread only if `thread_id` still maps to `expected`.
@@ -1439,6 +1485,16 @@ impl ThreadManager {
     pub async fn shutdown_all_threads_bounded(&self, timeout: Duration) -> ThreadShutdownReport {
         let threads = {
             let threads = self.state.threads.read().await;
+            // Fence loaded trees before draining retained ones. An in-flight root eviction
+            // cannot insert its runtime into the cache after this shutdown snapshot.
+            for thread in threads.values() {
+                thread
+                    .session
+                    .services
+                    .local_agent_runtime
+                    .request_shutdown();
+            }
+            self.state.root_runtimes.shutdown_all();
             threads
                 .iter()
                 .map(|(thread_id, thread)| (*thread_id, Arc::clone(thread)))
@@ -2065,6 +2121,40 @@ impl ThreadManagerState {
 
     /// Spawn a new thread with optional history and register it with the manager.
     async fn spawn_thread(&self, mut request: ThreadSpawnRequest) -> CodexResult<NewThread> {
+        // Normal client resumes must share the tree retained by native root eviction.
+        // Serialize startup with sender-driven resumes and the exact eviction handoff.
+        let root_resume_guard = if self.agent_control_factory.is_none()
+            && !request.options.config.ephemeral
+            && request.options.initial_history.get_multi_agent_version()
+                == Some(MultiAgentVersion::V2)
+            && !request
+                .options
+                .session_source
+                .as_ref()
+                .unwrap_or(&self.session_source)
+                .is_non_root_agent()
+            && let InitialHistory::Resumed(resumed) = &request.options.initial_history
+            && let AgentControlInit::Local(control) = &mut request.agent_control
+        {
+            let thread_id = resumed.conversation_id;
+            let guard = self.root_runtimes.gate(thread_id).lock_owned().await;
+            let threads = self.threads.read().await;
+            let runtime = threads
+                .get(&thread_id)
+                .filter(|thread| {
+                    thread.multi_agent_version() == Some(MultiAgentVersion::V2)
+                        && !thread.session_source.is_non_root_agent()
+                })
+                .map(|thread| thread.session.services.local_agent_runtime.clone())
+                .or_else(|| self.root_runtimes.get(thread_id));
+            if let Some(runtime) = runtime {
+                control.runtime = runtime;
+            }
+            Some(guard)
+        } else {
+            None
+        };
+        let is_root_resume = root_resume_guard.is_some();
         let runtime = request.agent_control.runtime().clone();
         let membership = runtime.admit_start()?;
         let owns_startup = request.startup.is_none();
@@ -2074,7 +2164,10 @@ impl ThreadManagerState {
                 .get_or_insert_with(|| Arc::new(SessionStartup::default())),
         );
         startup_state.hold_membership(membership);
-        let startup_guard =
+        if let Some(guard) = root_resume_guard {
+            startup_state.hold_root_resume(guard);
+        }
+        let mut startup_guard =
             owns_startup.then(|| SessionStartupGuard::new(Arc::clone(&startup_state)));
         let ThreadSpawnRequest {
             startup,
@@ -2436,7 +2529,13 @@ impl ThreadManagerState {
             session.services.mcp_runtime.enable_full_access_form_input();
         }
         let finalize_result = self
-            .finalize_thread_spawn(session, io, tracked_session_source, initial_host_config)
+            .finalize_thread_spawn(
+                session,
+                io,
+                tracked_session_source,
+                initial_host_config,
+                &startup_state,
+            )
             .await;
         let new_thread = match finalize_result {
             Ok(new_thread) => new_thread,
@@ -2447,6 +2546,16 @@ impl ThreadManagerState {
                 return Err(error);
             }
         };
+        if is_root_resume {
+            // Publication is the root startup commit. There must be no await between
+            // registration and this handoff: lifecycle-hook cancellation must not stop a
+            // visible root after senders or automatic wakeup can consume its retained mail.
+            runtime.clear_evicted_environments(new_thread.thread_id);
+            startup_state.release_membership();
+            if let Some(startup_guard) = startup_guard.take() {
+                startup_guard.disarm();
+            }
+        }
         new_thread.thread.emit_thread_ready_lifecycle().await;
         if source_changed_during_startup.load(Ordering::Acquire) {
             new_thread.thread.session.request_mcp_runtime_refresh();
@@ -2467,6 +2576,7 @@ impl ThreadManagerState {
         io: SessionIo,
         session_source: SessionSource,
         initial_host_config: Option<AgentConfigUpdate>,
+        startup: &SessionStartup,
     ) -> CodexResult<NewThread> {
         let thread_id = session.thread_id();
         let event = io.next_event().await?;
@@ -2482,6 +2592,12 @@ impl ThreadManagerState {
 
         {
             let mut threads = self.threads.write().await;
+            if session.services.local_agent_runtime.shutdown.is_cancelled() {
+                return Err(
+                    CodexErr::InvalidRequest("agent runtime is shutting down".to_owned())
+                        .with_agent_context(AgentErrorContext::RuntimeShutdown),
+                );
+            }
             if let std::collections::hash_map::Entry::Vacant(e) = threads.entry(thread_id) {
                 if let Some(update) = initial_host_config {
                     session
@@ -2497,6 +2613,8 @@ impl ThreadManagerState {
                     session_source,
                 ));
                 e.insert(thread.clone());
+                self.root_runtimes
+                    .remove_if_matches(thread_id, &thread.session.services.local_agent_runtime);
                 return Ok(NewThread {
                     thread_id,
                     thread,
@@ -2505,6 +2623,8 @@ impl ThreadManagerState {
             }
         }
 
+        // A resumed root's dispatch loop stays paused until publication commits.
+        startup.cancel_root_resume();
         if let Err(err) = io.shutdown_and_wait().await {
             warn!("failed to shut down duplicate thread {thread_id}: {err}");
         }

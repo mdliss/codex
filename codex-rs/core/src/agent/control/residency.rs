@@ -1,4 +1,4 @@
-//! Accounts for resident MAv2 children and unloads exact idle runtimes while preserving their state.
+//! Accounts for resident MAv2 children and unloads exact idle roots or children without losing mail.
 
 use super::LocalAgentControl;
 use super::LocalAgentRuntime;
@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use tracing::warn;
 
-/// The result of trying to unload one exact MAv2 child runtime.
+/// The result of trying to unload one exact MAv2 runtime.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ThreadEvictionOutcome {
     /// Work or another teardown owns the runtime; retry later.
@@ -37,10 +37,19 @@ impl ThreadManagerState {
         thread: Arc<CodexThread>,
         membership: &AgentTreeMembership,
     ) -> CodexResult<ThreadEvictionOutcome> {
+        let thread_id = thread.session.thread_id;
+        let is_root = !thread.session_source.is_non_root_agent();
+        let root_guard = if is_root {
+            let Ok(guard) = self.root_runtimes.gate(thread_id).try_lock_owned() else {
+                return Ok(ThreadEvictionOutcome::Busy);
+            };
+            Some(guard)
+        } else {
+            None
+        };
         let Ok(residency_guard) = Arc::clone(&thread.residency_gate).try_write_owned() else {
             return Ok(ThreadEvictionOutcome::Busy);
         };
-        let thread_id = thread.session.thread_id;
         if !self
             .get_thread(thread_id)
             .await
@@ -48,7 +57,7 @@ impl ThreadManagerState {
         {
             return Ok(ThreadEvictionOutcome::NotCurrent);
         }
-        if !is_resident_candidate(&thread) || !is_unloadable(&thread).await {
+        if !is_eviction_candidate(&thread) || !is_unloadable(&thread).await {
             return Ok(ThreadEvictionOutcome::Busy);
         }
         let manager = Arc::clone(self);
@@ -57,6 +66,7 @@ impl ThreadManagerState {
             .into_teardown_guard("resident_eviction", Some(thread_id));
         // Once shutdown is submitted, cancellation cannot release delivery or capacity early.
         tokio::spawn(async move {
+            let _root_guard = root_guard;
             let _residency_guard = residency_guard;
             thread.ensure_rollout_materialized().await;
             if let Err(err) = thread.shutdown_and_wait().await {
@@ -66,21 +76,13 @@ impl ThreadManagerState {
             }
             // Dispatch has stopped and the residency guard excludes senders. A tree
             // shutdown deliberately discards its mailbox instead of retaining it.
-            let mail = thread
-                .session
-                .input_queue
-                .drain_mailbox()
-                .await
-                .into_iter()
-                .map(|mail| mail.communication)
-                .collect();
             let runtime = &thread.session.services.local_agent_runtime;
-            let _ = runtime.mailboxes.enqueue(thread_id, /*id*/ None, mail);
+            runtime.retain_pending_mail(&thread.session).await;
             let environments = thread.environment_selections().await;
             let mut threads = manager.threads.write().await;
-            if threads
+            if !threads
                 .get(&thread_id)
-                .is_some_and(|registered| !Arc::ptr_eq(registered, &thread))
+                .is_some_and(|registered| Arc::ptr_eq(registered, &thread))
             {
                 teardown.complete();
                 return Ok(ThreadEvictionOutcome::NotCurrent);
@@ -88,6 +90,9 @@ impl ThreadManagerState {
             runtime
                 .registry
                 .save_evicted_environments(thread_id, environments);
+            if is_root {
+                manager.root_runtimes.retain(thread_id, runtime);
+            }
             let removed = threads.remove(&thread_id).is_some();
             runtime.residency.remove(thread_id);
             teardown.complete();
@@ -160,7 +165,7 @@ impl LocalAgentRuntime {
         state: &ThreadManagerState,
         thread: &Arc<CodexThread>,
     ) -> CodexResult<Option<tokio::sync::OwnedRwLockReadGuard<()>>> {
-        if !is_resident_candidate(thread) {
+        if !is_eviction_candidate(thread) {
             return Ok(None);
         }
         let guard = Arc::clone(&thread.residency_gate).read_owned().await;
@@ -168,7 +173,10 @@ impl LocalAgentRuntime {
         if !Arc::ptr_eq(thread, &state.get_thread(thread_id).await?) {
             return Err(CodexErr::ThreadNotFound(thread_id));
         }
-        self.residency.touch(thread_id);
+        // Root mail needs the same delivery exclusion, but roots never consume child capacity.
+        if is_resident_candidate(thread) {
+            self.residency.touch(thread_id);
+        }
         Ok(Some(guard))
     }
 }
@@ -306,18 +314,26 @@ fn is_resident_candidate(thread: &CodexThread) -> bool {
         && is_v2_resident_session_source(&thread.session_source)
 }
 
+fn is_eviction_candidate(thread: &CodexThread) -> bool {
+    thread.multi_agent_version() == Some(MultiAgentVersion::V2)
+        && !thread.session_source.is_internal()
+}
+
 pub(super) fn is_v2_resident_session_source(session_source: &SessionSource) -> bool {
     matches!(session_source, SessionSource::SubAgent(_))
 }
 
 async fn is_unloadable(thread: &CodexThread) -> bool {
-    matches!(
-        thread.agent_status().await,
-        AgentStatus::PendingInit
-            | AgentStatus::Completed(_)
-            | AgentStatus::Errored(_)
-            | AgentStatus::Interrupted
-    ) && thread.session.active_turn.lock().await.is_none()
+    // Ephemeral sessions must retain their model context until explicitly closed.
+    !thread.config().await.ephemeral
+        && matches!(
+            thread.agent_status().await,
+            AgentStatus::PendingInit
+                | AgentStatus::Completed(_)
+                | AgentStatus::Errored(_)
+                | AgentStatus::Interrupted
+        )
+        && thread.session.active_turn.lock().await.is_none()
         && !thread.session.has_outstanding_durable_sleep()
         && !thread
             .session

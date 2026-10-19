@@ -17,6 +17,8 @@ use codex_protocol::protocol::Op;
 use codex_thread_store::LiveThreadInitGuard;
 use futures::future::BoxFuture;
 use tokio::sync::Mutex;
+use tokio::sync::OwnedMutexGuard;
+use tokio::sync::watch;
 
 use super::SessionIo;
 use super::session::Session;
@@ -24,12 +26,49 @@ use super::session::Session;
 #[derive(Default)]
 pub(crate) struct SessionStartup {
     teardown: StdMutex<Option<AgentTreeTeardownGuard>>,
+    root_resume: StdMutex<Option<RootResumeStartup>>,
     pub(crate) persistence: Mutex<LiveThreadInitGuard>,
     pub(crate) session: OnceLock<Arc<Session>>,
     pub(crate) io: OnceLock<SessionIo>,
 }
 
+struct RootResumeStartup {
+    gate: OwnedMutexGuard<()>,
+    ready: Option<watch::Sender<bool>>,
+}
+
 impl SessionStartup {
+    pub(crate) fn hold_root_resume(&self, gate: OwnedMutexGuard<()>) {
+        let previous = self
+            .root_resume
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .replace(RootResumeStartup {
+                gate,
+                ready: Some(watch::channel(false).0),
+            });
+        assert!(previous.is_none(), "root resume gate already set");
+    }
+
+    pub(crate) fn root_resume_ready(&self) -> Option<watch::Receiver<bool>> {
+        self.root_resume
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .and_then(|resume| resume.ready.as_ref().map(watch::Sender::subscribe))
+    }
+
+    pub(crate) fn cancel_root_resume(&self) {
+        if let Some(resume) = self
+            .root_resume
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            resume.ready.take();
+        }
+    }
+
     fn lock_teardown(&self) -> MutexGuard<'_, Option<AgentTreeTeardownGuard>> {
         self.teardown.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -60,9 +99,27 @@ impl SessionStartup {
         if let Some(teardown) = self.lock_teardown().take() {
             teardown.complete();
         }
+        if let Some(resume) = self
+            .root_resume
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            && let Some(ready) = resume.ready
+        {
+            ready.send_replace(true);
+        }
     }
 
     pub(crate) async fn cleanup(&self) {
+        // Closing the unpublished latch lets its loop shut down without consuming mail.
+        // Keep the root gate through writer shutdown. Unpublished loops never take
+        // shared mail, so leave that queue untouched for the next resume.
+        let _root_resume_gate = self
+            .root_resume
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            .map(|resume| resume.gate);
         let mut teardown = self.lock_teardown().take();
         if let Some(teardown) = teardown.as_mut()
             && let Some(session) = self.session.get()
@@ -123,9 +180,15 @@ impl SessionStartupGuard {
     }
 
     pub(crate) fn cleanup(mut self) -> BoxFuture<'static, ()> {
-        Box::pin(async move {
-            if let Some(startup) = self.startup.take() {
+        let cleanup = self.startup.take().map(|startup| {
+            tokio::spawn(async move {
                 startup.cleanup().await;
+            })
+        });
+        Box::pin(async move {
+            // Cancellation only stops waiting; teardown still owns its gate and membership.
+            if let Some(cleanup) = cleanup {
+                let _ = cleanup.await;
             }
         })
     }

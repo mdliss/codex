@@ -144,9 +144,12 @@ impl AgentRegistry {
             })
             .agent_id;
         if let Some(root_thread_id) = root_thread_id {
+            // Restoring metadata can precede a failed or cancelled resume. Keep the
+            // retained root's eviction snapshot until its new runtime is published.
             active_agents
                 .thread_paths
-                .insert(root_thread_id, RegisteredAgent::new(root_path));
+                .entry(root_thread_id)
+                .or_insert_with(|| RegisteredAgent::new(root_path));
         }
     }
 
@@ -221,6 +224,11 @@ impl AgentRegistry {
             })
             .cloned()
             .collect()
+    }
+
+    /// Includes pending reservations so an unloaded root keeps an admitted child's tree.
+    pub(crate) fn has_spawned_agents(&self) -> bool {
+        self.total_count.load(Ordering::Acquire) != 0
     }
 
     fn register_spawned_thread(&self, agent_metadata: AgentMetadata) {

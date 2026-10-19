@@ -612,9 +612,14 @@ impl LocalAgentControl {
             };
         // Reserving a slot can evict an idle nested parent. Capture its instructions and
         // analytics metadata alongside its authority before the live parent can disappear.
-        let residency_slot = self
-            .reserve_v2_residency_slot(&state, &config, &membership, Some(thread_id))
-            .await?;
+        let residency_slot = if super::residency::is_v2_resident_session_source(&session_source) {
+            Some(
+                self.reserve_v2_residency_slot(&state, &config, &membership, Some(thread_id))
+                    .await?,
+            )
+        } else {
+            None
+        };
 
         match state
             .resume_thread_with_history_with_source(ResumeThreadWithHistoryOptions {
@@ -643,7 +648,9 @@ impl LocalAgentControl {
                         .pin_v2_residency(&state, &reloaded_thread.thread)
                         .await?;
                     runtime.registry.clear_evicted_environments(thread_id);
-                    residency_slot.commit(reloaded_thread.thread_id);
+                    if let Some(residency_slot) = residency_slot {
+                        residency_slot.commit(reloaded_thread.thread_id);
+                    }
                     // Register before listeners can forward events from the resumed thread.
                     if let Some((client_metadata, source)) = subagent_analytics {
                         let thread_config = reloaded_thread.thread.config_snapshot().await;
@@ -672,9 +679,10 @@ impl LocalAgentControl {
                     if let Some(parent_thread_id) = owner_thread_id {
                         self.validate_loaded_v2_child(&thread, parent_thread_id)?;
                     }
-                    self.runtime.registry.clear_evicted_environments(thread_id);
                     drop(residency_slot);
-                    return self.runtime.pin_v2_residency(&state, &thread).await;
+                    let residency_pin = self.runtime.pin_v2_residency(&state, &thread).await?;
+                    self.runtime.registry.clear_evicted_environments(thread_id);
+                    return Ok(residency_pin);
                 }
                 Err(err)
             }

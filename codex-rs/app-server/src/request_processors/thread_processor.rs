@@ -32,6 +32,7 @@ use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_thread_store::PersistContext;
 use std::ops::ControlFlow;
@@ -3762,7 +3763,7 @@ impl ThreadRequestProcessor {
         self.thread_watch_manager.subscribe_running_turn_count()
     }
 
-    /// Best-effort: start the lifecycle listener and subscribe initialized connections.
+    /// Best-effort: start the lifecycle listener and subscribe relevant initialized connections.
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "listener state creation must be serialized against pending unloads"
@@ -3772,68 +3773,113 @@ impl ThreadRequestProcessor {
         thread_id: ThreadId,
         connection_ids: Vec<ConnectionId>,
     ) {
-        if connection_ids.is_empty() {
-            let result = loop {
-                let pending = self.pending_thread_unloads.lock().await;
-                if let Some(unload) = pending.get(&thread_id) {
-                    // A replacement can be published before the old listener finishes cleanup.
-                    let mut completion = unload.subscribe();
-                    drop(pending);
-                    let _ = completion.changed().await;
-                    continue;
-                }
-                let Ok(thread) = self.thread_manager.get_thread(thread_id).await else {
-                    return;
-                };
-                // Only persisted V2 children can reload after idle eviction.
-                if thread.multi_agent_version() != Some(MultiAgentVersion::V2)
-                    || thread.config().await.ephemeral
-                {
-                    return;
-                }
-                self.thread_watch_manager
-                    .upsert_thread(&thread_id.to_string())
-                    .await;
-                let thread_state = self.thread_state_manager.thread_state(thread_id).await;
-                let result = self
-                    .ensure_listener_task_running(thread_id, thread, thread_state)
-                    .await;
+        let result = loop {
+            let pending = self.pending_thread_unloads.lock().await;
+            if let Some(unload) = pending.get(&thread_id) {
+                // A replacement can be published before the old listener finishes cleanup.
+                let mut completion = unload.subscribe();
                 drop(pending);
-                break result;
-            };
-            if let Err(err) = result {
-                warn!(
-                    "failed to start listener for thread {thread_id}: {message}",
-                    message = err.message
-                );
+                let _ = completion.changed().await;
+                continue;
             }
-            return;
-        }
-
-        let mut raw_events_enabled = false;
-        if let Ok(thread) = self.thread_manager.get_thread(thread_id).await {
+            let Ok(thread) = self.thread_manager.get_thread(thread_id).await else {
+                return;
+            };
             let config_snapshot = thread.config_snapshot().await;
-            self.thread_watch_manager
-                .upsert_thread(&thread_id.to_string())
-                .await;
-            if let Some(parent_thread_id) = config_snapshot.parent_thread_id {
-                raw_events_enabled = self
-                    .thread_state_manager
+            let is_v2_thread = thread.multi_agent_version() == Some(MultiAgentVersion::V2)
+                && !config_snapshot.session_source.is_internal();
+            let is_v2_child = is_v2_thread
+                && matches!(config_snapshot.session_source, SessionSource::SubAgent(_));
+            // Persisted V2 roots can reload while their clients are disconnected.
+            // Keep their unobserved lifecycle listener for idle eviction too.
+            if connection_ids.is_empty() && (!is_v2_thread || config_snapshot.ephemeral) {
+                return;
+            }
+
+            let mut ancestor_thread_ids = Vec::new();
+            if is_v2_child {
+                // A grandchild can be published before its parent's listener is attached.
+                // Resolve ancestry here, but check live subscriptions only when inserting.
+                let mut ancestor = config_snapshot.parent_thread_id;
+                let mut visited = HashSet::from([thread_id]);
+                while let Some(parent_thread_id) = ancestor
+                    && visited.insert(parent_thread_id)
+                {
+                    ancestor_thread_ids.push(parent_thread_id);
+                    ancestor = if let Ok(parent) =
+                        self.thread_manager.get_thread(parent_thread_id).await
+                    {
+                        parent.config_snapshot().await.parent_thread_id
+                    } else {
+                        self.thread_store
+                            .read_thread(StoreReadThreadParams {
+                                thread_id: parent_thread_id,
+                                include_archived: true,
+                                include_history: false,
+                            })
+                            .await
+                            .ok()
+                            .and_then(|parent| parent.parent_thread_id)
+                    };
+                }
+            }
+
+            let raw_events_enabled = if !connection_ids.is_empty()
+                && let Some(parent_thread_id) = config_snapshot.parent_thread_id
+            {
+                self.thread_state_manager
                     .thread_state(parent_thread_id)
                     .await
                     .lock()
                     .await
-                    .experimental_raw_events;
-            }
-        }
+                    .experimental_raw_events
+            } else {
+                false
+            };
+            self.thread_watch_manager
+                .upsert_thread(&thread_id.to_string())
+                .await;
 
-        for connection_id in connection_ids {
-            log_listener_attach_result(
-                self.ensure_conversation_listener(thread_id, connection_id, raw_events_enabled)
-                    .await,
-                thread_id,
-                connection_id,
-                "thread",
+            // Core residency can replace a runtime while ancestry or listener state is read.
+            let Ok(current_thread) = self.thread_manager.get_thread(thread_id).await else {
+                return;
+            };
+            if !Arc::ptr_eq(&current_thread, &thread) {
+                drop(pending);
+                continue;
+            }
+            let (thread_state, newly_subscribed) = self
+                .thread_state_manager
+                .inherit_thread_subscriptions(
+                    thread_id,
+                    &connection_ids,
+                    is_v2_child.then_some(ancestor_thread_ids.as_slice()),
+                )
+                .await;
+            if raw_events_enabled {
+                thread_state
+                    .lock()
+                    .await
+                    .set_experimental_raw_events(/*enabled*/ true);
+            }
+            let result = self
+                .ensure_listener_task_running(thread_id, thread, thread_state)
+                .await;
+            if result.is_err() {
+                for connection_id in newly_subscribed {
+                    let _ = self
+                        .thread_state_manager
+                        .unsubscribe_connection_from_thread(thread_id, connection_id)
+                        .await;
+                }
+            }
+            drop(pending);
+            break result;
+        };
+        if let Err(err) = result {
+            warn!(
+                "failed to start listener for thread {thread_id}: {message}",
+                message = err.message
             );
         }
     }

@@ -8,6 +8,7 @@ use crate::agent::api::AgentControl;
 use crate::agent::registry::AgentRegistry;
 use crate::config::RolloutBudgetConfig;
 use crate::rollout_budget::RolloutBudget;
+use crate::session::session::Session;
 use crate::thread_manager::AgentTreeShutdownFailure;
 use crate::thread_manager::AgentTreeShutdownFailureReason;
 use crate::thread_manager::AgentTreeShutdownReport;
@@ -235,6 +236,32 @@ impl LocalAgentRuntime {
             session_id,
             runtime: self.clone(),
         }
+    }
+
+    pub(crate) fn same_tree(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.registry, &other.registry)
+    }
+
+    pub(crate) fn has_unloaded_state(&self) -> bool {
+        self.registry.has_spawned_agents() || self.mailboxes.has_pending()
+    }
+
+    /// Call after publication while the root resume gate or a residency pin is held.
+    pub(crate) fn clear_evicted_environments(&self, thread_id: ThreadId) {
+        self.registry.clear_evicted_environments(thread_id);
+    }
+
+    /// Call only after dispatch stops and delivery is excluded by the caller's gate.
+    pub(crate) async fn retain_pending_mail(&self, session: &Session) {
+        let mail = session
+            .input_queue
+            .drain_mailbox()
+            .await
+            .into_iter()
+            .map(|mail| mail.communication)
+            .collect();
+        // Explicit tree shutdown closes the mailbox and deliberately discards unread mail.
+        let _ = self.mailboxes.enqueue(session.thread_id, /*id*/ None, mail);
     }
 }
 

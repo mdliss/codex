@@ -29,6 +29,8 @@ use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ThreadClosedNotification;
 use codex_app_server_protocol::ThreadLoadedListResponse;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::ThreadUnsubscribeResponse;
+use codex_app_server_protocol::ThreadUnsubscribeStatus;
 use codex_core::config::ConfigBuilder;
 use codex_login::AuthManager;
 use core_test_support::fs_wait::wait_for_path_exists;
@@ -223,11 +225,37 @@ MCP_TEST_PID_FILE = {}
     Ok(())
 }
 
-#[test_case(0, false; "v2_zero_delay")]
-#[test_case(1, false; "v2_one_second_delay")]
-#[test_case(1, true; "ephemeral_v2_followup_after_idle_deadline")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChildListenerConnections {
+    None,
+    Unrelated,
+    Owner,
+    OwnerAndUnrelated,
+}
+
+#[test_case(0, false, ChildListenerConnections::None; "v2_zero_delay")]
+#[test_case(1, false, ChildListenerConnections::None; "v2_one_second_delay")]
+#[test_case(1, true, ChildListenerConnections::None; "ephemeral_v2_followup_after_idle_deadline")]
+#[test_case(0, false, ChildListenerConnections::Unrelated; "unrelated_client_zero_delay")]
+#[test_case(1, false, ChildListenerConnections::Unrelated; "unrelated_client_does_not_pin_child")]
+#[test_case(1, false, ChildListenerConnections::OwnerAndUnrelated; "only_owner_inherits_child_subscription")]
+#[test_case(1, true, ChildListenerConnections::Unrelated; "unrelated_client_preserves_ephemeral_followup")]
+#[test_case(1, true, ChildListenerConnections::Owner; "owner_disconnect_preserves_ephemeral_followup")]
+#[test_case(1, true, ChildListenerConnections::OwnerAndUnrelated; "owner_disconnect_with_unrelated_client_preserves_ephemeral_followup")]
 #[tokio::test]
-async fn disconnected_v2_child_lifecycle(unload_delay_secs: u64, ephemeral: bool) -> Result<()> {
+async fn disconnected_v2_child_lifecycle(
+    unload_delay_secs: u64,
+    ephemeral: bool,
+    connections: ChildListenerConnections,
+) -> Result<()> {
+    let owner_connected = matches!(
+        connections,
+        ChildListenerConnections::Owner | ChildListenerConnections::OwnerAndUnrelated
+    );
+    let unrelated_connected = matches!(
+        connections,
+        ChildListenerConnections::Unrelated | ChildListenerConnections::OwnerAndUnrelated
+    );
     let (release_spawn, spawn_gate) = oneshot::channel();
     let (release_spawn_completion, spawn_completion_gate) = oneshot::channel();
     let (release_first_completion, first_completion_gate) = oneshot::channel();
@@ -315,6 +343,8 @@ async fn disconnected_v2_child_lifecycle(unload_delay_secs: u64, ephemeral: bool
     let mut created = processor.thread_created_receiver();
     let owner_id = ConnectionId(1);
     let owner = Arc::new(ConnectionSessionState::new(ConnectionOrigin::WebSocket));
+    let unrelated_id = ConnectionId(2);
+    let unrelated = Arc::new(ConnectionSessionState::new(ConnectionOrigin::WebSocket));
     let result: Result<()> = async {
         send_request(
             &processor,
@@ -331,6 +361,23 @@ async fn disconnected_v2_child_lifecycle(unload_delay_secs: u64, ephemeral: bool
         processor
             .connection_initialized(owner_id, owner.request_attestation())
             .await;
+        if unrelated_connected {
+            send_request(
+                &processor,
+                unrelated_id,
+                &unrelated,
+                json!({"id": 100, "method": "initialize", "params": {
+                    "clientInfo": {"name": "unrelated-client", "version": "1"},
+                    "capabilities": {"experimentalApi": true}
+                }}),
+            )
+            .await;
+            let _: InitializeResponse =
+                read_response_from(&mut outgoing, unrelated_id, /*request_id*/ 100).await;
+            processor
+                .connection_initialized(unrelated_id, unrelated.request_attestation())
+                .await;
+        }
         send_request(
             &processor,
             owner_id,
@@ -358,9 +405,11 @@ async fn disconnected_v2_child_lifecycle(unload_delay_secs: u64, ephemeral: bool
         )
         .await?;
 
-        // Finish connection cleanup before the model can create a child. Dispatch the
-        // core creation event exactly as the app-server does with no initialized clients.
-        processor.connection_closed(owner_id, &owner).await;
+        // Keep the unrelated client connected while the child's owner is either
+        // already disconnected or still watching the parent at creation time.
+        if !owner_connected {
+            processor.connection_closed(owner_id, &owner).await;
+        }
         release_spawn.send(()).expect("parent response is waiting");
         let child_id = timeout(Duration::from_secs(/*secs*/ 10), created.recv()).await??;
         let child_runtime = Arc::downgrade(
@@ -370,20 +419,64 @@ async fn disconnected_v2_child_lifecycle(unload_delay_secs: u64, ephemeral: bool
                 .get_thread(child_id)
                 .await?,
         );
-        let attach = processor.try_attach_thread_listener(child_id, Vec::new());
+        let initialized_connections = match connections {
+            ChildListenerConnections::None => Vec::new(),
+            ChildListenerConnections::Unrelated => vec![unrelated_id],
+            ChildListenerConnections::Owner => vec![owner_id],
+            ChildListenerConnections::OwnerAndUnrelated => vec![owner_id, unrelated_id],
+        };
+        let attach = processor.try_attach_thread_listener(child_id, initialized_connections);
         tokio::pin!(attach);
-        // The old runtime has left core, but its app-server cleanup still owns the ID.
-        let pending = &processor.thread_processor.pending_thread_unloads;
-        pending
-            .lock()
-            .await
-            .insert(child_id, tokio::sync::watch::channel(()).0);
-        assert!(
-            futures::poll!(&mut attach).is_pending(),
-            "attachment must wait for old cleanup"
-        );
-        pending.lock().await.remove(&child_id);
+        if matches!(
+            connections,
+            ChildListenerConnections::None | ChildListenerConnections::OwnerAndUnrelated
+        ) {
+            // The old runtime has left core, but its app-server cleanup still owns the ID.
+            let pending = &processor.thread_processor.pending_thread_unloads;
+            pending
+                .lock()
+                .await
+                .insert(child_id, tokio::sync::watch::channel(()).0);
+            assert!(
+                futures::poll!(&mut attach).is_pending(),
+                "attachment must wait for old cleanup"
+            );
+            pending.lock().await.remove(&child_id);
+        }
         attach.await;
+        if unrelated_connected {
+            send_request(
+                &processor,
+                unrelated_id,
+                &unrelated,
+                json!({"id": 101, "method": "thread/unsubscribe", "params": {
+                    "threadId": child_id.to_string()
+                }}),
+            )
+            .await;
+            let response: ThreadUnsubscribeResponse =
+                read_response_from(&mut outgoing, unrelated_id, /*request_id*/ 101).await;
+            assert_eq!(
+                response.status,
+                ThreadUnsubscribeStatus::NotSubscribed,
+                "unrelated initialized clients must not inherit a child subscription"
+            );
+        }
+        if owner_connected {
+            send_request(
+                &processor,
+                owner_id,
+                &owner,
+                json!({"id": 102, "method": "thread/unsubscribe", "params": {
+                    "threadId": child_id.to_string()
+                }}),
+            )
+            .await;
+            let response: ThreadUnsubscribeResponse =
+                read_response_from(&mut outgoing, owner_id, /*request_id*/ 102).await;
+            assert_eq!(response.status, ThreadUnsubscribeStatus::Unsubscribed);
+            processor.connection_closed(owner_id, &owner).await;
+        }
         // Keep the spawn response open until the child's model request arrives, so
         // the next gated response belongs to the parent regardless of scheduling.
         timeout(
@@ -474,6 +567,54 @@ async fn disconnected_v2_child_lifecycle(unload_delay_secs: u64, ephemeral: bool
                 previous_reply["content"],
                 json!([{"type": "output_text", "text": "Done"}])
             );
+
+            // Idle preservation must not keep a listener's runtime alive after an
+            // explicit shutdown. Keep the processor alive to isolate listener cleanup.
+            let shutdown_and_release = async {
+                while !matches!(child.agent_status().await, AgentStatus::Completed(_)) {
+                    tokio::task::yield_now().await;
+                }
+                child
+                    .shutdown_and_wait()
+                    .await
+                    .context("explicitly shut down the ephemeral child")?;
+                let removed = processor
+                    .thread_processor
+                    .thread_manager
+                    .remove_thread(&child_id)
+                    .await
+                    .context("ephemeral child must remain registered until explicit removal")?;
+                assert!(Arc::ptr_eq(&removed, &child));
+                drop(removed);
+                drop(child);
+
+                loop {
+                    let loaded = processor
+                        .thread_processor
+                        .thread_manager
+                        .list_thread_ids()
+                        .await;
+                    if !loaded.contains(&child_id) && child_runtime.upgrade().is_none() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                anyhow::Ok(())
+            };
+            tokio::pin!(shutdown_and_release);
+            timeout(Duration::from_secs(/*secs*/ 10), async {
+                loop {
+                    tokio::select! {
+                        result = &mut shutdown_and_release => break result,
+                        envelope = outgoing.recv() => {
+                            // Status notifications must not block terminal event handling.
+                            envelope.context("outgoing channel closed during child cleanup")?;
+                        }
+                    }
+                }
+            })
+            .await
+            .context("explicitly shut-down ephemeral child still retains its runtime")??;
             return Ok(());
         }
         release_first_completion
