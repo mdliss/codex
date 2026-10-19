@@ -261,6 +261,8 @@ pub(super) async fn ensure_listener_task_running(
     let config_snapshot = conversation.config_snapshot().await;
     let is_v2_child = conversation.multi_agent_version() == Some(MultiAgentVersion::V2)
         && matches!(config_snapshot.session_source, SessionSource::SubAgent(_));
+    // Ephemeral children have no stored history to reload after idle eviction.
+    let can_idle_unload = !is_v2_child || !config.ephemeral;
     let thread_settings_baseline = thread_settings_from_config_snapshot(&config_snapshot);
     let (mut listener_command_rx, listener_generation) = {
         let mut thread_state = thread_state.lock().await;
@@ -386,16 +388,21 @@ pub(super) async fn ensure_listener_task_running(
                         thread_watch_manager.clone(),
                     )
                     .await;
-                    if matches!(event.msg, EventMsg::ShutdownComplete)
-                        && let Some(completion_tx) = thread_state
+                    if matches!(event.msg, EventMsg::ShutdownComplete) {
+                        if let Some(completion_tx) = thread_state
                             .lock()
                             .await
                             .take_shutdown_drain_waiter()
-                    {
-                        let _ = completion_tx.send(());
+                        {
+                            let _ = completion_tx.send(());
+                        }
+                        if !can_idle_unload {
+                            // Retain ephemeral history while idle, but release it on explicit close.
+                            break;
+                        }
                     }
                 }
-                unloading_watchers_open = unloading_state.wait_for_unloading_trigger() => {
+                unloading_watchers_open = unloading_state.wait_for_unloading_trigger(), if can_idle_unload => {
                     if !unloading_watchers_open {
                         break;
                     }

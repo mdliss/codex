@@ -1928,6 +1928,14 @@ mod message_processor_tracing_tests;
 mod gateway_oauth_tests;
 
 #[cfg(test)]
+#[path = "message_processor_idle_agent_mail_tests.rs"]
+mod idle_agent_mail_tests;
+
+#[cfg(test)]
+#[path = "message_processor_agent_subscription_tests.rs"]
+mod agent_subscription_tests;
+
+#[cfg(test)]
 #[path = "message_processor_thread_lifecycle_tests.rs"]
 mod thread_lifecycle_tests;
 

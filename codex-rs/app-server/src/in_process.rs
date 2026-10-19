@@ -525,6 +525,7 @@ async fn start_uninitialized(mut args: InProcessStartArgs) -> IoResult<InProcess
                 crate::transport::ConnectionOrigin::InProcess,
             ));
             let mut listen_for_threads = true;
+            let mut thread_listener_tasks = tokio::task::JoinSet::new();
 
             loop {
                 tokio::select! {
@@ -570,6 +571,11 @@ async fn start_uninitialized(mut args: InProcessStartArgs) -> IoResult<InProcess
                             }
                         }
                     }
+                    result = thread_listener_tasks.join_next(), if !thread_listener_tasks.is_empty() => {
+                        if let Some(Err(err)) = result {
+                            warn!("thread listener attachment failed: {err}");
+                        }
+                    }
                     created = thread_created_rx.recv(), if listen_for_threads => {
                         match created {
                             Ok(thread_id) => {
@@ -578,9 +584,13 @@ async fn start_uninitialized(mut args: InProcessStartArgs) -> IoResult<InProcess
                                 } else {
                                     Vec::<ConnectionId>::new()
                                 };
-                                processor
-                                    .try_attach_thread_listener(thread_id, connection_ids)
-                                    .await;
+                                let processor = Arc::clone(&processor);
+                                // Attachment can wait for cleanup; keep requests and shutdown responsive.
+                                thread_listener_tasks.spawn(async move {
+                                    processor
+                                        .try_attach_thread_listener(thread_id, connection_ids)
+                                        .await;
+                                });
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                                 warn!("thread_created receiver lagged; skipping resync");
@@ -593,6 +603,7 @@ async fn start_uninitialized(mut args: InProcessStartArgs) -> IoResult<InProcess
                 }
             }
 
+            thread_listener_tasks.shutdown().await;
             processor.clear_runtime_references();
             processor.cancel_active_login().await;
             processor
